@@ -5,119 +5,148 @@ from datetime import date
 from dateutil.relativedelta import relativedelta
 import os
 
-# ---------------- DB CONNECTION ----------------
+# ==============================
+# DATABASE CONNECTION (NEON)
+# ==============================
 def get_connection():
-    return psycopg2.connect(
-        host=os.environ["PG_HOST"],
-        database=os.environ["PG_DB"],
-        user=os.environ["PG_USER"],
-        password=os.environ["PG_PASSWORD"],
-        port=os.environ["PG_PORT"],
-        sslmode="require"
-    )
+    database_url = os.environ.get("DATABASE_URL")
 
-# ---------------- EMI CALCULATION ----------------
+    if not database_url:
+        st.error("DATABASE_URL is missing. Add it in Streamlit → Secrets.")
+        st.stop()
+
+    return psycopg2.connect(database_url, sslmode="require")
+
+
+# ==============================
+# DB HELPERS
+# ==============================
+def get_person_id(conn, name):
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM persons WHERE name=%s", (name,))
+    row = cur.fetchone()
+
+    if row:
+        return row[0]
+
+    cur.execute("INSERT INTO persons(name) VALUES(%s) RETURNING id", (name,))
+    pid = cur.fetchone()[0]
+    conn.commit()
+    return pid
+
+
 def generate_emi_schedule(
-    loan_amount, tenure, annual_interest, start_date, emi_overrides=None
+    amount,
+    months,
+    annual_interest,
+    start_date,
+    emi_override=None
 ):
-    balance = loan_amount
-    monthly_rate = annual_interest / 12 / 100
     schedule = []
 
-    for month in range(1, tenure + 1):
-        principal = round(balance / (tenure - month + 1), 2)
-        interest = round(balance * monthly_rate, 2)
-        emi = round(principal + interest, 2)
+    monthly_principal = round(amount / months, 2)
+    balance = amount
+    rate = annual_interest / 100 / 12
+    emi_date = start_date
 
-        # Allow manual EMI override
-        if emi_overrides and month in emi_overrides:
-            emi = emi_overrides[month]
-            principal = round(emi - interest, 2)
+    for i in range(1, months + 1):
+        interest = round(balance * rate, 2)
 
+        principal = monthly_principal
+        if emi_override and i == 1:
+            principal = round(emi_override - interest, 2)
+
+        total = round(principal + interest, 2)
         balance = round(balance - principal, 2)
 
         schedule.append({
-            "month": month,
-            "emi_date": start_date + relativedelta(months=month),
+            "emi_no": i,
+            "emi_date": emi_date,
             "principal": principal,
             "interest": interest,
-            "total": emi,
+            "total": total,
             "balance": max(balance, 0)
         })
 
+        emi_date += relativedelta(months=1)
+
     return schedule
 
-# ---------------- UI ----------------
-st.set_page_config(page_title="Loan EMI App", layout="wide")
-st.title("Loan EMI Management")
 
-tab1, tab2 = st.tabs(["Create Loan", "Monthly EMI View"])
+# ==============================
+# APP UI
+# ==============================
+st.set_page_config(page_title="Loan EMI Manager", layout="wide")
+st.title("💰 Loan EMI Manager")
 
-# ---------------- CREATE LOAN ----------------
-with tab1:
-    st.subheader("Create Loan")
+menu = st.sidebar.radio(
+    "Menu",
+    ["New Loan", "Monthly EMI View", "Person Statement"]
+)
 
-    name = st.text_input("Customer Name")
+conn = get_connection()
+cur = conn.cursor()
 
-    loan_amount = st.number_input(
-        "Loan Amount",
-        min_value=1.0,
-        value=1.0,
+# ==============================
+# 1. NEW LOAN
+# ==============================
+if menu == "New Loan":
+    st.header("➕ New Loan")
+
+    person_mode = st.radio("Person", ["Existing", "New Person"])
+
+    cur.execute("SELECT name FROM persons ORDER BY name")
+    persons = [r[0] for r in cur.fetchall()]
+
+    if person_mode == "Existing":
+        if persons:
+            person_name = st.selectbox("Select Person", persons)
+        else:
+            st.warning("No existing persons. Please add a new person.")
+            person_mode = "New Person"
+
+    if person_mode == "New Person":
+        person_name = st.text_input("Enter Name")
+
+    loan_date = st.date_input("Loan Date", date.today())
+    amount = st.number_input("Loan Amount", min_value=1.0, step=1.0)
+    tenure = st.number_input("Tenure (Months)", min_value=1, step=1)
+    interest = st.number_input("Annual Interest (%)", min_value=0.0, step=0.1)
+
+    emi_start = loan_date + relativedelta(months=1)
+    st.info(f"EMI Starts: {emi_start.strftime('%d-%m-%Y')}")
+
+    st.subheader("EMI Overrides (Optional)")
+    emi_override = st.number_input(
+        "EMI for Month 1 (leave 0 for auto)",
+        min_value=0.0,
         step=1.0
     )
+    if emi_override == 0:
+        emi_override = None
 
-    tenure = st.number_input(
-        "Tenure (Months)",
-        min_value=1,
-        value=1,
-        step=1
-    )
+    if st.button("Generate & Save Loan"):
+        if not person_name.strip():
+            st.error("Person name is required")
+            st.stop()
 
-    interest = st.number_input(
-        "Annual Interest (%)",
-        min_value=1.0,
-        value=1.0,
-        step=0.1
-    )
-
-    loan_date = st.date_input("Loan Date", value=date.today())
-    emi_start = loan_date
-
-    st.markdown("### EMI Overrides (Optional)")
-    emi_overrides = {}
-
-    for i in range(1, tenure + 1):
-        override = st.number_input(
-            f"EMI for Month {i} (leave default if unchanged)",
-            min_value=1.0,
-            value=1.0,
-            step=1.0,
-            key=f"emi_{i}"
-        )
-        emi_overrides[i] = override
-
-    if st.button("Create Loan"):
-        conn = get_connection()
-        cur = conn.cursor()
-
-        cur.execute(
-            "INSERT INTO persons(name) VALUES(%s) ON CONFLICT (name) DO NOTHING",
-            (name,)
-        )
-
-        cur.execute("SELECT id FROM persons WHERE name=%s", (name,))
-        person_id = cur.fetchone()[0]
+        pid = get_person_id(conn, person_name.strip())
 
         cur.execute("""
-            INSERT INTO loans(person_id, loan_date, amount, tenure, interest, emi_start)
-            VALUES (%s,%s,%s,%s,%s,%s)
+            INSERT INTO loans
+            (person_id, loan_date, amount, tenure, interest, emi_start, active)
+            VALUES (%s,%s,%s,%s,%s,%s,true)
             RETURNING loan_id
-        """, (person_id, loan_date, loan_amount, tenure, interest, emi_start))
+        """, (pid, loan_date, amount, tenure, interest, emi_start))
 
         loan_id = cur.fetchone()[0]
 
         schedule = generate_emi_schedule(
-            loan_amount, tenure, interest, emi_start, emi_overrides
+            amount,
+            tenure,
+            interest,
+            emi_start,
+            emi_override
         )
 
         for row in schedule:
@@ -135,36 +164,78 @@ with tab1:
             ))
 
         conn.commit()
-        conn.close()
+        st.success("Loan saved successfully 🎉")
 
-        st.success("Loan and EMI schedule created successfully")
+# ==============================
+# 2. MONTHLY EMI VIEW
+# ==============================
+elif menu == "Monthly EMI View":
+    st.header("📅 Monthly EMI Collection")
 
-# ---------------- MONTHLY VIEW ----------------
-with tab2:
-    st.subheader("Monthly EMI Collection")
+    months = pd.read_sql("""
+        SELECT DISTINCT to_char(emi_date,'YYYY-MM') AS month
+        FROM emi_schedule
+        ORDER BY month
+    """, conn)
 
-    conn = get_connection()
+    if months.empty:
+        st.info("No EMI data available.")
+        st.stop()
+
+    selected = st.selectbox("Select Month", months["month"])
 
     df = pd.read_sql("""
         SELECT p.name, e.emi_date, e.principal, e.interest, e.total
         FROM emi_schedule e
-        JOIN loans l ON e.loan_id = l.loan_id
-        JOIN persons p ON l.person_id = p.id
+        JOIN loans l ON e.loan_id=l.loan_id
+        JOIN persons p ON l.person_id=p.id
+        WHERE to_char(e.emi_date,'YYYY-MM')=%s
+    """, conn, params=(selected,))
+
+    df = df.reset_index(drop=True)  # REMOVE 0 INDEX FROM UI
+
+    st.metric("Total Collection", f"₹ {df['total'].sum():,.2f}")
+    st.dataframe(df, use_container_width=True)
+
+# ==============================
+# 3. PERSON STATEMENT
+# ==============================
+elif menu == "Person Statement":
+    st.header("👤 Person Ledger")
+
+    cur.execute("SELECT name FROM persons ORDER BY name")
+    persons = [r[0] for r in cur.fetchall()]
+
+    if not persons:
+        st.info("No persons available.")
+        st.stop()
+
+    sel = st.selectbox("Select Person", persons)
+    pid = get_person_id(conn, sel)
+
+    loans = pd.read_sql("""
+        SELECT loan_id, loan_date, amount, tenure, interest, active
+        FROM loans
+        WHERE person_id=%s
+    """, conn, params=(pid,))
+
+    st.subheader("Loans")
+    st.dataframe(loans, use_container_width=True)
+
+    history = pd.read_sql("""
+        SELECT e.emi_date, e.principal, e.interest, e.total, e.balance
+        FROM emi_schedule e
+        JOIN loans l ON e.loan_id=l.loan_id
+        WHERE l.person_id=%s
         ORDER BY e.emi_date
-    """, conn)
+    """, conn, params=(pid,))
 
-    conn.close()
+    st.subheader("EMI History")
+    st.dataframe(history, use_container_width=True)
 
-    df["month"] = df["emi_date"].dt.to_period("M").astype(str)
-
-    selected_month = st.selectbox(
-        "Select Month",
-        sorted(df["month"].unique())
+    st.download_button(
+        "Download Statement CSV",
+        history.to_csv(index=False).encode("utf-8"),
+        f"{sel}_statement.csv"
     )
-
-    result = df[df["month"] == selected_month].reset_index(drop=True)
-    result.index = result.index + 1  # REMOVE 0 FROM UI
-
-    st.metric("Total Collection", f"₹ {result['total'].sum():,.2f}")
-    st.dataframe(result, use_container_width=True)
     
