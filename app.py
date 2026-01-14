@@ -1,158 +1,170 @@
 import streamlit as st
+import psycopg2
 import pandas as pd
 from datetime import date
 from dateutil.relativedelta import relativedelta
+import os
 
-from db import get_person_id, insert_loan, insert_emi_schedule, read_df
-from emi import generate_emi_schedule
+# ---------------- DB CONNECTION ----------------
+def get_connection():
+    return psycopg2.connect(
+        host=os.environ["PG_HOST"],
+        database=os.environ["PG_DB"],
+        user=os.environ["PG_USER"],
+        password=os.environ["PG_PASSWORD"],
+        port=os.environ["PG_PORT"],
+        sslmode="require"
+    )
 
-st.set_page_config(page_title="Loan EMI Manager", layout="wide")
+# ---------------- EMI CALCULATION ----------------
+def generate_emi_schedule(
+    loan_amount, tenure, annual_interest, start_date, emi_overrides=None
+):
+    balance = loan_amount
+    monthly_rate = annual_interest / 12 / 100
+    schedule = []
 
-menu = st.sidebar.selectbox(
-    "Menu",
-    ["New Loan", "Monthly EMI View", "Person Statement", "Export Reports", "Admin Settings"]
-)
+    for month in range(1, tenure + 1):
+        principal = round(balance / (tenure - month + 1), 2)
+        interest = round(balance * monthly_rate, 2)
+        emi = round(principal + interest, 2)
 
-# ---------- NEW LOAN ----------
-if menu == "New Loan":
-    st.header("➕ New Loan")
+        # Allow manual EMI override
+        if emi_overrides and month in emi_overrides:
+            emi = emi_overrides[month]
+            principal = round(emi - interest, 2)
 
-    person_mode = st.radio("Person", ["Existing", "New Person"])
+        balance = round(balance - principal, 2)
 
-    # read persons safely
-    try:
-        persons_df = read_df("SELECT id, name FROM persons")
-        persons = persons_df["name"].tolist() if not persons_df.empty else []
-    except Exception:
-        persons = []
+        schedule.append({
+            "month": month,
+            "emi_date": start_date + relativedelta(months=month),
+            "principal": principal,
+            "interest": interest,
+            "total": emi,
+            "balance": max(balance, 0)
+        })
 
-    selected_person = None
-    new_name = None
+    return schedule
 
-    if person_mode == "Existing":
-        if persons:
-            selected_person = st.selectbox("Select Person", persons)
-        else:
-            st.info("No existing persons. Please add a new person.")
-            person_mode = "New Person"
-    if person_mode == "New Person":
-        new_name = st.text_input("Enter Name")
+# ---------------- UI ----------------
+st.set_page_config(page_title="Loan EMI App", layout="wide")
+st.title("Loan EMI Management")
 
-    l_date = st.date_input("Loan Date", value=date.today())
-    l_amount = st.number_input("Amount", min_value=1.0, format="%f")
-    l_tenure = st.number_input("Tenure (months)", min_value=1, step=1)
-    l_int = st.number_input("Interest %", min_value=0.0, format="%f")
+tab1, tab2 = st.tabs(["Create Loan", "Monthly EMI View"])
 
-    emi_start = l_date + relativedelta(months=1)
-    st.info(f"EMI Starts: {emi_start.strftime('%d-%m-%Y')}")
+# ---------------- CREATE LOAN ----------------
+with tab1:
+    st.subheader("Create Loan")
 
-    if st.button("Generate & Save Loan"):
-        if (person_mode == "Existing" and selected_person) or (person_mode == "New Person" and new_name):
-            name = selected_person if person_mode == "Existing" else new_name
-            pid = get_person_id(name)
+    name = st.text_input("Customer Name")
 
-            # Generate schedule
-            schedule = generate_emi_schedule(
-                l_amount, int(l_tenure), float(l_int), emi_start
-            )
+    loan_amount = st.number_input(
+        "Loan Amount",
+        min_value=1.0,
+        value=1.0,
+        step=1.0
+    )
 
-            # Insert loan and schedule
-            loan_id = insert_loan(pid, l_date, l_amount, int(l_tenure), l_int, emi_start)
-            insert_emi_schedule(loan_id, schedule)
+    tenure = st.number_input(
+        "Tenure (Months)",
+        min_value=1,
+        value=1,
+        step=1
+    )
 
-            st.success("Loan Saved Successfully!")
-        else:
-            st.error("Select or add a person")
+    interest = st.number_input(
+        "Annual Interest (%)",
+        min_value=1.0,
+        value=1.0,
+        step=0.1
+    )
 
-# ---------- MONTHLY VIEW ----------
-elif menu == "Monthly EMI View":
-    st.header("📅 Monthly EMI Collection")
+    loan_date = st.date_input("Loan Date", value=date.today())
+    emi_start = loan_date
 
-    try:
-        months_df = read_df("SELECT DISTINCT to_char(emi_date,'YYYY-MM') AS m FROM emi_schedule ORDER BY m")
-        months = months_df["m"].tolist() if not months_df.empty else []
-    except Exception:
-        months = []
+    st.markdown("### EMI Overrides (Optional)")
+    emi_overrides = {}
 
-    if months:
-        sel_month = st.selectbox("Select Month", months)
+    for i in range(1, tenure + 1):
+        override = st.number_input(
+            f"EMI for Month {i} (leave default if unchanged)",
+            min_value=1.0,
+            value=1.0,
+            step=1.0,
+            key=f"emi_{i}"
+        )
+        emi_overrides[i] = override
 
-        df = read_df("""
-            SELECT p.name, e.emi_date, e.principal, e.interest, e.total
-            FROM emi_schedule e
-            JOIN loans l ON e.loan_id = l.loan_id
-            JOIN persons p ON l.person_id = p.id
-            WHERE to_char(e.emi_date,'YYYY-MM') = :m
-            ORDER BY e.emi_date
-        """, {"m": sel_month})
+    if st.button("Create Loan"):
+        conn = get_connection()
+        cur = conn.cursor()
 
-        if not df.empty:
-            st.metric("Total Collection", f"₹ {df['total'].sum():,.0f}")
-            st.dataframe(df, use_container_width=True)
-        else:
-            st.info("No records for this month.")
-    else:
-        st.info("No EMI data available yet.")
-
-# ---------- PERSON STATEMENT ----------
-elif menu == "Person Statement":
-    st.header("👤 Person Statement")
-
-    try:
-        persons_df = read_df("SELECT id, name FROM persons")
-    except Exception:
-        persons_df = pd.DataFrame(columns=["id", "name"])
-
-    if persons_df.empty:
-        st.info("No persons found. Add a loan with a new person first.")
-    else:
-        sel = st.selectbox("Select Person", persons_df["name"].tolist())
-        pid = int(persons_df[persons_df["name"] == sel]["id"].values[0])
-
-        hist = read_df("""
-            SELECT l.loan_date, e.emi_date, e.principal, e.interest, e.total, e.balance
-            FROM emi_schedule e
-            JOIN loans l ON e.loan_id = l.loan_id
-            WHERE l.person_id = :pid
-            ORDER BY e.emi_date
-        """, {"pid": pid})
-
-        st.subheader("EMI History")
-        st.dataframe(hist, use_container_width=True)
-        st.download_button(
-            "Download CSV",
-            hist.to_csv(index=False).encode("utf-8"),
-            f"{sel}_statement.csv"
+        cur.execute(
+            "INSERT INTO persons(name) VALUES(%s) ON CONFLICT (name) DO NOTHING",
+            (name,)
         )
 
-# ---------- EXPORT ----------
-elif menu == "Export Reports":
-    st.header("📂 Export Full Data")
+        cur.execute("SELECT id FROM persons WHERE name=%s", (name,))
+        person_id = cur.fetchone()[0]
 
-    if st.button("Export EMI Schedule"):
-        try:
-            df = read_df("SELECT * FROM emi_schedule")
-            st.download_button(
-                "Download CSV",
-                df.to_csv(index=False).encode("utf-8"),
-                "emi_schedule.csv"
-            )
-        except Exception as e:
-            st.error(f"Failed to export: {e}")
+        cur.execute("""
+            INSERT INTO loans(person_id, loan_date, amount, tenure, interest, emi_start)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            RETURNING loan_id
+        """, (person_id, loan_date, loan_amount, tenure, interest, emi_start))
 
-# ---------- ADMIN SETTINGS ----------
-elif menu == "Admin Settings":
-    st.header("⚙️ Admin")
-    # store basic defaults in session_state
-    if "def_tenure" not in st.session_state:
-        st.session_state.def_tenure = 12
-    if "def_int" not in st.session_state:
-        st.session_state.def_int = 12.0
+        loan_id = cur.fetchone()[0]
 
-    new_t = st.number_input("Default Tenure", value=st.session_state.def_tenure, min_value=1)
-    new_i = st.number_input("Default Interest", value=float(st.session_state.def_int), min_value=0.0)
+        schedule = generate_emi_schedule(
+            loan_amount, tenure, interest, emi_start, emi_overrides
+        )
 
-    if st.button("Update Defaults"):
-        st.session_state.def_tenure = int(new_t)
-        st.session_state.def_int = float(new_i)
-        st.success("Updated!")
+        for row in schedule:
+            cur.execute("""
+                INSERT INTO emi_schedule
+                (loan_id, emi_date, principal, interest, total, balance)
+                VALUES (%s,%s,%s,%s,%s,%s)
+            """, (
+                loan_id,
+                row["emi_date"],
+                row["principal"],
+                row["interest"],
+                row["total"],
+                row["balance"]
+            ))
+
+        conn.commit()
+        conn.close()
+
+        st.success("Loan and EMI schedule created successfully")
+
+# ---------------- MONTHLY VIEW ----------------
+with tab2:
+    st.subheader("Monthly EMI Collection")
+
+    conn = get_connection()
+
+    df = pd.read_sql("""
+        SELECT p.name, e.emi_date, e.principal, e.interest, e.total
+        FROM emi_schedule e
+        JOIN loans l ON e.loan_id = l.loan_id
+        JOIN persons p ON l.person_id = p.id
+        ORDER BY e.emi_date
+    """, conn)
+
+    conn.close()
+
+    df["month"] = df["emi_date"].dt.to_period("M").astype(str)
+
+    selected_month = st.selectbox(
+        "Select Month",
+        sorted(df["month"].unique())
+    )
+
+    result = df[df["month"] == selected_month].reset_index(drop=True)
+    result.index = result.index + 1  # REMOVE 0 FROM UI
+
+    st.metric("Total Collection", f"₹ {result['total'].sum():,.2f}")
+    st.dataframe(result, use_container_width=True)
+    
